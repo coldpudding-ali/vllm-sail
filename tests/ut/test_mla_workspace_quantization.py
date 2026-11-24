@@ -65,6 +65,7 @@ def _make_case(ppu, quantized):
         num_heads=2,
         v_head_dim=4,
         qk_nope_head_dim=2,
+        use_shardq=False,
         chunked_prefill_workspace_size=128,
         impl=NS(reserve_workspace=lambda: events.append(("reserve",))),
     )
@@ -214,6 +215,7 @@ def sparse_forward_case():
         is_amx_bmm_enabled=False,
         W_UK_T=torch.ones(2, 2, 3),
         kv_cache_dtype="auto",
+        use_shardq=False,
         use_pcp=False,
         prefill_backend=None,
         _use_sparse_mha=lambda meta: False,

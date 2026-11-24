@@ -42,6 +42,10 @@ _MOE_SOURCE_CASES = [
 def moe_source_boundary(modules, upstream_source_root):
     """读取真实 getter、格式及支持检查；其他准入谓词为边界替身，不证明设备能力。"""
     ns = SimpleNamespace
+    modules(
+        "vllm.model_executor.layers.quantization.online.requantization",
+        is_requantization_source=lambda: False,
+    )
     root = upstream_source_root / "vllm/model_executor/layers/fused_moe"
     formats = function(
         root / "modular_kernel.py", "FusedMoEActivationFormat", {"Enum": Enum}
@@ -67,6 +71,7 @@ def moe_source_boundary(modules, upstream_source_root):
                 use_nixl_ep_kernels=False,
                 use_deepep_v2_kernels=format_name == "PaddedStandard",
                 use_moonep_kernels=False,
+                use_alltoall_batched_kernels=False,
             ),
             is_act_and_mul=True,
             activation="silu",
@@ -82,7 +87,14 @@ def moe_source_boundary(modules, upstream_source_root):
     admission = function(
         root / "modular_kernel.py",
         "FusedMoEExperts.is_supported_config",
-        {"envs": ns(VLLM_BATCH_INVARIANT=False)},
+        {
+            "envs": ns(VLLM_BATCH_INVARIANT=False),
+            "check_activation_quant_fallback": function(
+                root.parent / "quantization/utils/quant_utils.py",
+                "check_activation_quant_fallback",
+                {},
+            ),
+        },
     )
 
     def expert(format_name):
@@ -92,6 +104,13 @@ def moe_source_boundary(modules, upstream_source_root):
             {
                 "activation_format": staticmethod(lambda: formats[format_name]),
                 "is_supported_config": staticmethod(admission),
+                "executed_activation_key": staticmethod(
+                    function(
+                        root / "modular_kernel.py",
+                        "FusedMoEExperts.executed_activation_key",
+                        {},
+                    )
+                ),
                 "is_monolithic": staticmethod(lambda: False),
                 **{
                     name: staticmethod(lambda *args: True)
@@ -216,6 +235,7 @@ def test_real_public_moe_selectors_preserve_ppu_format_boundary(
         is_cuda=lambda: True,
         is_rocm=lambda: False,
         is_tpu=lambda: False,
+        is_xpu=lambda: False,
         is_out_of_tree=lambda: False,
     )
     modules("vllm.platforms", current_platform=platform)
@@ -256,7 +276,28 @@ def test_real_public_moe_selectors_preserve_ppu_format_boundary(
         "map_" + ("wna16" if module == "int_wna16" else module) + "_backend",
         namespace,
     )
-    load_moe_oracle(path, oracle_name, namespace)
+    if module == "int_wna16":
+        namespace.update(
+            user_activation_override=lambda *args: (None, None),
+            get_current_vllm_config_or_none=lambda: None,
+            check_activation_quant_fallback=lambda *args: None,
+        )
+        for helper in (
+            "_requested_activation_key",
+            "_backend_activation_key",
+            "_filter_by_activation",
+            "_activation_fallback_reason",
+        ):
+            function(path, helper, namespace)
+    resolved_oracle = load_moe_oracle(path, oracle_name, namespace)
+    setattr(namespace["oracle"], oracle_name, resolved_oracle)
+    if module == "int_wna16":
+        namespace["oracle"]._requested_activation_key = namespace[
+            "_requested_activation_key"
+        ]
+        namespace["oracle"]._activation_fallback_reason = namespace[
+            "_activation_fallback_reason"
+        ]
     namespace["_upstream_" + select_name] = function(path, select_name, namespace)
     if module in ("fp8", "int_wna16"):
         function(
@@ -288,6 +329,37 @@ def test_real_public_moe_selectors_preserve_ppu_format_boundary(
         assert result == (expected_backend, boundary.experts[format_name])
 
 
+@pytest.mark.parametrize("case", _MOE_SOURCE_CASES)
+def test_explicit_batched_ppu_requantization_source_never_selects_compute(case):
+    module, enum_name, oracle_name, select_name = case
+    placeholder = (object(), object())
+    config = SimpleNamespace(
+        moe_backend="ppu_deep_gemm",
+        activation_format=SimpleNamespace(is_batched=True),
+        is_lora_enabled=False,
+    )
+    oracle = SimpleNamespace(maybe_skip_for_requantization_source=lambda: placeholder)
+    provider = SimpleNamespace(kInt8StaticChannelSym=None, kInt8DynamicTokenSym=None)
+    setattr(provider, oracle_name, oracle)
+    env = {
+        "oracle": provider,
+        enum_name: SimpleNamespace(PPU_DEEPGEMM=object()),
+        "_PPU_ALIASES": ("ppu_deep_gemm",),
+    }
+    path = f"vllm_sail/registry/moe_backends/{module}.py"
+    if module == "fp8":
+        function(path, "_select_ppu_backend", env)
+    if module == "int_wna16":
+        function(path, "_select_batched_ppu_backend", env)
+    args = {
+        "unquantized": (),
+        "fp8": (None, None),
+        "int8": (None, None),
+        "int_wna16": (None, None, False, False),
+    }[module]
+    assert function(path, select_name, env)(config, *args) is placeholder
+
+
 def _real_unquantized_lora_selector(modules, boundary, accelerated):
     """读取真实 selector/共享 oracle；仅替换设备准入及专家计算边界。"""
     path = boundary.root / "oracle/unquantized.py"
@@ -295,6 +367,7 @@ def _real_unquantized_lora_selector(modules, boundary, accelerated):
     events, logs = [], []
     platform = SimpleNamespace(
         is_tpu=lambda: False,
+        is_xpu=lambda: False,
         is_out_of_tree=lambda: False,
     )
 
@@ -468,7 +541,7 @@ def test_wna16_bound_maker_uses_shared_format_guard_before_expert_construction(
         "make_moe_kernel",
         {
             "maybe_make_prepare_finalize": prepare_finalize,
-            "logger": ns(info_once=lambda *a: None),
+            "logger": ns(info_once=lambda *a: None, debug_once=lambda *a: None),
             "mk": ns(
                 FusedMoEKernel=lambda pf, experts: ns(
                     prepare_finalize=pf, experts=experts
@@ -480,6 +553,7 @@ def test_wna16_bound_maker_uses_shared_format_guard_before_expert_construction(
         ("cpu_moe", "CPUExpertsInt4"),
         ("int4_emulation_moe", "Int4EmulationTritonExperts"),
         ("rdna3_moe", "Rdna3WNA16Experts"),
+        ("rdna3_int4_int8_moe", "Rdna3Int4Int8Experts"),
         ("xpu_moe", "XPUExpertsWNA16"),
         ("zentorch_moe", "ZentorchExpertsWNA16"),
     ):
@@ -600,7 +674,7 @@ def nvfp4_factory_boundary(moe_source_boundary):
         "make_moe_kernel",
         {
             "maybe_make_prepare_finalize": prepare_finalize,
-            "logger": ns(info_once=lambda *a: None),
+            "logger": ns(info_once=lambda *a: None, debug_once=lambda *a: None),
             "mk": ns(FusedMoEKernel=assemble),
         },
     )
@@ -633,6 +707,7 @@ def nvfp4_factory_boundary(moe_source_boundary):
 
 
 _NVFP4_BACKENDS = [
+    "NONE",
     "B12X",
     "FLASHINFER_TRTLLM",
     "FLASHINFER_CUTLASS",

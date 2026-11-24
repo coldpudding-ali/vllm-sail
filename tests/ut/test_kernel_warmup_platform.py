@@ -72,7 +72,16 @@ def test_real_replayssm_lifecycle_admission_uses_config_not_cuda_identity(
             "replayssm_lifecycle_warmup",
             {},
         )
-        assert lifecycle(NS(vllm_config=NS(use_flashinfer_replayssm=False))) is None
+        assert (
+            lifecycle(
+                NS(
+                    vllm_config=NS(
+                        use_flashinfer_replayssm=False, use_replayssm_trackers=False
+                    )
+                )
+            )
+            is None
+        )
 
 
 @pytest.mark.upstream_source
@@ -96,7 +105,9 @@ def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
     mixer_cls = type("MambaMixer2", (base,), {})
     spec_cls = type("MambaSpec", (), {})
     mixer = mixer_cls()
-    mixer.use_replayssm = mixer.use_flashinfer_replayssm = True
+    mixer.use_replayssm_trackers = mixer.use_replayssm = (
+        mixer.use_flashinfer_replayssm
+    ) = True
     mixer.replayssm_buffer_len = 4
     mixer.kv_cache = [torch.full((5, 2), 7.0), torch.full((5, 3), 9.0)]
     mixer._replayssm_ring_start = torch.ones(5, dtype=torch.int32)
@@ -106,6 +117,7 @@ def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
     table = torch.full((1, 4), 99, dtype=torch.int32)
     config = NS(
         use_flashinfer_replayssm=True,
+        use_replayssm_trackers=True,
         use_v2_model_runner=v2,
         compilation_config=NS(static_forward_context={"mixer": mixer}),
     )
@@ -115,7 +127,13 @@ def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
         decode_query_len=2,
         uniform_decode_query_len=2,
         kv_cache_config=NS(
-            kv_cache_groups=[NS(kv_cache_spec=spec, layer_names=["mixer"])]
+            kv_cache_groups=[
+                NS(
+                    kv_cache_spec=spec,
+                    kv_cache_specs={"mixer": spec},
+                    layer_names=["mixer"],
+                )
+            ]
         ),
         block_tables=NS(input_block_tables=[table]),
         input_batch=NS(block_table=[NS(get_device_tensor=lambda n: table)]),
@@ -123,6 +141,14 @@ def test_real_replayssm_lifecycle_bounds_scratch_and_cleans_after_failure(
     )
     modules("vllm.model_executor.layers.mamba.abstract", MambaBase=base)
     modules("vllm.model_executor.layers.mamba.mamba_mixer2", MambaMixer2=mixer_cls)
+    modules(
+        "vllm.v1.core.kv_cache_utils",
+        is_mamba_group=lambda group: isinstance(group.kv_cache_spec, spec_cls),
+        is_mamba_prefix_caching_group=lambda group: getattr(
+            group.kv_cache_spec, "mamba_cache_mode", None
+        )
+        == "align",
+    )
     modules("vllm.v1.kv_cache_interface", MambaSpec=spec_cls)
     modules(
         "vllm.v1.worker.extensible_kv_cache",
@@ -211,6 +237,7 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
         "cutedsl_warmup": ["cutedsl_warmup"],
         "deep_gemm_warmup": ["deep_gemm_warmup"],
         "flashinfer_autotune_cache": [
+            "get_flashinfer_mm_encoder_autotune_config",
             "resolve_flashinfer_autotune_v2_root",
             "resolve_rank_flashinfer_autotune_file",
             "use_flashinfer_autotune_v2",
@@ -239,6 +266,8 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
         exception=lambda *a: None,
     )
     modules("vllm.logger", init_logger=lambda _: logger)
+    modules("vllm.v1.core.kv_cache_utils", KVCacheBlockCopy=unavailable)
+    modules("vllm.v1.worker.utils", copy_kv_cache_blocks_inplace=unavailable)
     modules("torch", nn=NS(Module=object), Tensor=object)
     envs = modules(
         "vllm.envs",
@@ -365,7 +394,7 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
     expected = ["sampler"] if ppu else []
     if jit:
         expected += ["registry", "triton"]
-    expected += ["qwen", "vl", "mamba", "replayssm_lifecycle"]
+    expected += ["qwen", "vl", "replayssm_lifecycle"]
     if jit:
         expected += ["kimi", "watermark", "qsa"]
     expected += ["gemm_rs_ar"]
@@ -413,16 +442,15 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
 
 
 @pytest.mark.upstream_source
-@pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize(
     "backends", [[], ["OTHER"], ["FLASHINFER", "OTHER"], ["FLASHINFER"]]
 )
 @pytest.mark.parametrize("remote_eligible", [0, 1])
 @pytest.mark.parametrize("pooling", [False, True])
 def test_flashinfer_warmup_coordinates_all_pp_ranks(
-    modules, upstream_source_root, v2, backends, remote_eligible, pooling
+    modules, upstream_source_root, backends, remote_eligible, pooling
 ):
-    """使用真实 helper 验证 V2 的 any 和旧 runner 的 all 集体决策。"""
+    """使用真实 helper 验证 任一 PP rank 有 FlashInfer 工作时所有 rank 一起预热。"""
     calls = []
     collective_inputs = []
 
@@ -456,7 +484,6 @@ def test_flashinfer_warmup_coordinates_all_pp_ranks(
     )
     groups = [NS(backend=NS(get_name=lambda name=name: name)) for name in backends]
     worker = NS(
-        use_v2_model_runner=v2,
         model_runner=NS(
             is_pooling_model=pooling, attn_groups=[groups] if groups else []
         ),
@@ -465,11 +492,11 @@ def test_flashinfer_warmup_coordinates_all_pp_ranks(
     eligible = (
         not pooling
         and bool(backends)
-        and (any if v2 else all)(name == "FLASHINFER" for name in backends)
+        and any(name == "FLASHINFER" for name in backends)
     )
     assert collective_inputs == [int(eligible)]
     count = int(eligible) + remote_eligible
-    assert calls == ([worker] if (count > 0 if v2 else count == 2) else [])
+    assert calls == ([worker] if count > 0 else [])
 
 
 @pytest.mark.upstream_source
@@ -558,9 +585,19 @@ def test_real_replayssm_lifecycle_skips_without_committable_eligible_state(
 
     base, spec_cls = type("MambaBase", (), {}), type("MambaSpec", (), {})
     mixer = base() if ineligible != "wrong-mixer" else NS()
-    mixer.use_flashinfer_replayssm = ineligible != "replay-disabled"
+    mixer.use_replayssm_trackers = mixer.use_flashinfer_replayssm = (
+        ineligible != "replay-disabled"
+    )
     spec = spec_cls() if ineligible != "non-mamba" else object()
     modules("vllm.model_executor.layers.mamba.abstract", MambaBase=base)
+    modules(
+        "vllm.v1.core.kv_cache_utils",
+        is_mamba_group=lambda group: isinstance(group.kv_cache_spec, spec_cls),
+        is_mamba_prefix_caching_group=lambda group: getattr(
+            group.kv_cache_spec, "mamba_cache_mode", None
+        )
+        == "align",
+    )
     modules("vllm.v1.kv_cache_interface", MambaSpec=spec_cls)
     modules(
         "vllm.v1.worker.replayssm_utils", ReplaySSMModelContext=NS(create=forbidden)
@@ -578,12 +615,14 @@ def test_real_replayssm_lifecycle_skips_without_committable_eligible_state(
     runner = NS(
         vllm_config=NS(
             use_flashinfer_replayssm=True,
+            use_replayssm_trackers=True,
             use_v2_model_runner=v2,
             compilation_config=NS(static_forward_context={"mixer": mixer}),
         ),
         kv_cache_config=NS(
             kv_cache_groups=[
                 NS(
+                    kv_cache_specs={"mixer": spec},
                     kv_cache_spec=spec,
                     layer_names=[] if ineligible == "no-mixer" else ["mixer"],
                 )
