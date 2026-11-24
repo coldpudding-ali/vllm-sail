@@ -1112,35 +1112,34 @@ def test_imported_requantization_scope_restores_context_and_skips_nvfp4_selectio
 ):
     from contextvars import Context
 
-    from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
-        Nvfp4QuantizationEmulationTritonExperts,
-    )
     from vllm.model_executor.layers.fused_moe.oracle import nvfp4
+    from vllm.model_executor.layers.fused_moe.oracle.base import (
+        RequantizationSourceExperts,
+    )
     from vllm.model_executor.layers.quantization.online import requantization as req
 
     def forbidden(*args, **kwargs):
         pytest.fail("requantization source 不得进入普通 backend selection")
 
     monkeypatch.setattr(nvfp4, "prioritize_humming", forbidden)
-    monkeypatch.setattr(nvfp4, "NvFp4MoEKernelOracle", forbidden)
     error = RuntimeError("requantization source scope failed")
     assert not req.is_requantization_source()
     with pytest.raises(RuntimeError) as raised:
-        with req.requantization_source_scope():
+        with req.skip_checkpoint_backend_selection():
             assert req.is_requantization_source()
             assert not Context().run(req.is_requantization_source)
             assert nvfp4.select_nvfp4_moe_backend(object(), object(), object()) == (
-                nvfp4.NvFp4MoeBackend.EMULATION,
-                Nvfp4QuantizationEmulationTritonExperts,
+                nvfp4.NvFp4MoeBackend.NONE,
+                RequantizationSourceExperts,
             )
             if fail_inside == "inner":
                 with pytest.raises(RuntimeError) as nested:
-                    with req.requantization_source_scope():
+                    with req.skip_checkpoint_backend_selection():
                         assert req.is_requantization_source()
                         raise error
                 assert nested.value is error and req.is_requantization_source()
             else:
-                with req.requantization_source_scope():
+                with req.skip_checkpoint_backend_selection():
                     assert req.is_requantization_source()
                 assert req.is_requantization_source()
             raise error
@@ -1164,7 +1163,9 @@ def test_imported_requantization_release_keeps_runtime_parameters_and_loader(
     assert not method.create_requantization_source_weights(layer)
     assert method.requantization_source_parameters == {}
     calls = []
-    loader = object()
+
+    def loader(param, weight):
+        param.data.copy_(weight)
 
     def create_weights(target, *args, **kwargs):
         calls.append((target, args, kwargs))
@@ -1175,11 +1176,12 @@ def test_imported_requantization_release_keeps_runtime_parameters_and_loader(
 
     source = SimpleNamespace(create_weights=create_weights)
     method.set_requantization_source(source)
-    assert method.requantization_source is source and method.uses_meta_device is False
+    assert method.requantization_source is source
     assert method.create_requantization_source_weights(layer, 17, marker="checkpoint")
     assert calls == [(layer, (17,), {"marker": "checkpoint"})]
     tracked = dict(method.requantization_source_parameters)
     assert set(tracked) == {"serialized", "obsolete"}
+    assert all(value.is_meta for value in tracked.values())
     assert all(getattr(layer, name) is value for name, value in tracked.items())
     assert all(value.requantization_source is True for value in tracked.values())
     assert all(
@@ -1191,7 +1193,9 @@ def test_imported_requantization_release_keeps_runtime_parameters_and_loader(
         new = torch.tensor([3.0, 6.0], device="cpu")
         f.utils.replace_parameter(layer, "serialized", new)
         runtime = layer.serialized
-        assert runtime is not tracked["serialized"] and runtime.weight_loader is loader
+        assert runtime is not tracked["serialized"]
+        assert runtime.weight_loader is tracked["serialized"].weight_loader
+        assert runtime.weight_loader.__wrapped__ is loader
         assert not getattr(runtime, "requantization_source", False)
         torch.testing.assert_close(runtime, new)
     elif action == "removed":

@@ -469,7 +469,13 @@ def test_real_streaming_session_mutates_owned_buffers_and_rehashes_kept_output(
     feature = NS(mm_position=Position(0, 1), identifier="session-image")
     update.mm_features = [feature] if update_tokens else []
     queued = object()
-    scheduler = NS(hash_block_size=2, num_waiting_for_streaming_input=3, log_stats=True)
+    scheduler = NS(
+        hash_block_size=2,
+        num_waiting_for_streaming_input=3,
+        log_stats=True,
+        num_sampled_tokens_per_step=1,
+        max_model_len=16,
+    )
     apply = function(
         upstream_source_root / "vllm/v1/core/sched/scheduler.py",
         "Scheduler._update_request_as_session",
@@ -480,7 +486,7 @@ def test_real_streaming_session_mutates_owned_buffers_and_rehashes_kept_output(
             "EngineCoreEventType": NS(QUEUED=queued),
         },
     )
-    apply(scheduler, session, update)
+    assert apply(scheduler, session, update) is True
     expected = [10, 20, 30, 40, 50] + (update_tokens or [])
     assert session.prompt_token_ids is prompt and session._all_token_ids is all_tokens
     assert session._output_token_ids is outputs
@@ -517,17 +523,14 @@ def test_real_streaming_session_mutates_owned_buffers_and_rehashes_kept_output(
 
 @pytest.mark.upstream_source
 @pytest.mark.requires_runtime
-@pytest.mark.parametrize("use_v2", [False, True])
 @pytest.mark.parametrize("use_pp", [False, True])
 @pytest.mark.parametrize("async_scheduling", [False, True])
 def test_real_cached_scheduler_payloads_copy_int32_tokens_before_worker_transport(
     modules,
     upstream_source_root,
-    use_v2,
     use_pp,
     async_scheduling,
 ):
-    import itertools
     import pickle
 
     state = _token_request_boundary(modules, upstream_source_root)
@@ -545,35 +548,24 @@ def test_real_cached_scheduler_payloads_copy_int32_tokens_before_worker_transpor
 
     scheduler = NS(
         use_pp=use_pp,
-        use_v2_model_runner=use_v2,
         scheduler_config=NS(async_scheduling=async_scheduling),
-        prev_step_scheduled_req_ids={"running"},
     )
     make = function(
         upstream_source_root / "vllm/v1/core/sched/scheduler.py",
         "Scheduler._make_cached_request_data",
-        {"itertools": itertools, "CachedRequestData": state.output.CachedRequestData},
+        {"CachedRequestData": state.output.CachedRequestData},
     )
     payload = make(
         scheduler,
-        [running],
-        [resumed],
+        [running, resumed],
         {"running": 3, "resumed": 2},
         {"running": [1], "resumed": [2]},
         {"running": NS(get_block_ids=blocks), "resumed": NS(get_block_ids=blocks)},
     )
     expected_new = [[40, 50], [80]] if use_pp and not async_scheduling else []
-    expected_all = {} if use_v2 else {"resumed": [60, 70, 80]}
-    assert payload.req_ids == ["running", "resumed"] and payload.resumed_req_ids == {
-        "resumed"
-    }
-    assert (
-        payload.new_token_ids == expected_new and payload.all_token_ids == expected_all
-    )
-    assert all(
-        type(value) is list
-        for value in [*payload.new_token_ids, *payload.all_token_ids.values()]
-    )
+    assert payload.req_ids == ["running", "resumed"]
+    assert payload.new_token_ids == expected_new
+    assert all(type(value) is list for value in payload.new_token_ids)
     assert payload.num_computed_tokens == [3, 2] and payload.num_output_tokens == [4, 1]
     assert payload.new_block_ids == [None, None] and block_calls == [True, True]
     assert payload.num_reqs == 2 and not payload.is_context_phase("running")
@@ -581,4 +573,3 @@ def test_real_cached_scheduler_payloads_copy_int32_tokens_before_worker_transpor
     running.append_output_token_ids(90)
     resumed.append_output_token_ids(100)
     assert payload.new_token_ids == transported.new_token_ids == expected_new
-    assert payload.all_token_ids == transported.all_token_ids == expected_all

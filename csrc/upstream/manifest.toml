@@ -212,6 +212,13 @@ hazards = ["cub"]
 ops = ["fused_add_rms_norm", "rms_norm"]
 
 [[entry]]
+path = "csrc/gdn/fused_gdn_decode_16bit_kernel.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Defines the FP16 and BF16 unsplit launch specializations referenced by fused_gdn_decode_kernel; both translation units must be linked into _upstream_C."
+
+[[entry]]
 path = "csrc/gdn/fused_gdn_decode_kernel.cu"
 tier = "a"
 hazards = ["cp_async", "ptx"]

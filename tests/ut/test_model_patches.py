@@ -2202,7 +2202,7 @@ def _glm_mtp_quant_boundary(modules, patch_utils_module, root, torch):
     mapper_module = modules(
         "vllm.model_executor.models.utils", field=field, replace=replace, logger=logger
     )
-    mapper = dataclass(
+    mapper = dataclass(slots=True)(
         function(model_dir / "utils.py", "WeightsMapper", mapper_module.__dict__)
     )
     mapper_module.WeightsMapper = mapper
@@ -2323,8 +2323,12 @@ def test_glm_mtp_real_mro_applies_rename_only_mapping_before_predictor(
     patch_module._enable_supports_quant()
     patch_module._enable_packed_modules_mapping()
     assert patch_utils_module.PATCH_REGISTRY == records
-    assert all(r.affected_versions == ">=0.32.0,<0.33.0" for r in records)
+    assert all("e83d82a" in r.affected_versions for r in records)
     mapper = captured.hf_to_vllm_mapper
+    assert not hasattr(mapper, "__dict__")
+    assert f"{state.module.__name__}.Glm5NextMTP.hf_to_vllm_mapper" in getattr(
+        mapper, patch_utils_module.PATCH_MARKER
+    )
     # 加载专用丢弃/堆叠/变换不能流入量化层列表；保留原 mapper 以独立比较。
     mapper.orig_to_new_substr = {"load_only": None}
     mapper.orig_to_new_stacked = {"gate_proj": ("wrong_fused", 0)}
@@ -2429,6 +2433,11 @@ def test_glm_real_decoder_keeps_mtp_topk_layout_and_unsummed_residual(
             "torch": torch,
             "_is_moe": lambda config: False,
             "_is_kda_layer": is_kda,
+            "_mla_dequantized_at_load": function(
+                upstream_source_root / "vllm/models/glm5next/common/model.py",
+                "_mla_dequantized_at_load",
+                {},
+            ),
             "Glm5NextMLAAttention": Attention,
             "Glm5NextMLP": MLP,
             "Glm5NextMoE": type("MoE", (), {}),
@@ -2471,7 +2480,7 @@ def test_glm_real_decoder_keeps_mtp_topk_layout_and_unsummed_residual(
     assert owner.layer_kind == "mla" and len(attention_calls) == len(mlp_calls) == 1
     assert attention_calls[0]["shardq_eligible"] is (not is_mtp)
     assert attention_calls[0]["topk_indices_buffer"] is topk
-    assert attention_calls[0]["quant_config"] is None
+    assert attention_calls[0]["quant_config"] is quant
     assert attention_calls[0]["cache_config"] is cache
     assert mlp_calls[0]["quant_config"] is quant
     assert owner.self_attn.o_proj.reduce_results is (is_mtp or not sequence_parallel)
