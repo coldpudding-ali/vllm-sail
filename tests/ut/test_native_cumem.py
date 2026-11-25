@@ -75,3 +75,16 @@ def test_failed_wake_retries_with_same_backup(allocator):
         ("weights", 11),
         ("weights", 11),
     ]
+
+
+def test_pluggable_allocator_hook_uses_hggc_callbacks(allocator, monkeypatch):
+    pool, _, _ = allocator
+    pool.python_malloc_callback = Mock()
+    pool.python_free_callback = Mock()
+    allocator_factory = Mock()
+    monkeypatch.setattr(cumem, "get_pluggable_allocator", allocator_factory)
+
+    assert pool._get_pluggable_allocator() is allocator_factory.return_value
+    allocator_factory.assert_called_once_with(
+        pool.python_malloc_callback, pool.python_free_callback
+    )

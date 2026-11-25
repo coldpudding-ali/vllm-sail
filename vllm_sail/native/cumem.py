@@ -52,6 +52,11 @@ def _create_allocator(base, native):
     from vllm.device_allocator.cumem import PIN_MEMORY
 
     class HggcAllocator(base):
+        def _get_pluggable_allocator(self):
+            return get_pluggable_allocator(
+                self.python_malloc_callback, self.python_free_callback
+            )
+
         def _python_free_callback(self, ptr):
             # PyTorch also frees segments whose Python records were trimmed.
             self.pointer_to_data.pop(ptr, None)
