@@ -146,6 +146,9 @@ jobs:
     needs: select
     if: ${{ needs.select.result == 'success' && !inputs.skip_wheel_build }}
     uses: ./.github/workflows/ppu-build-and-test.yaml
+    secrets:
+      ci_registry_username: ${{ secrets.RELEASE_USERNAME }}
+      ci_registry_token: ${{ secrets.RELEASE_TOKEN }}
     with:
       # target_sha is the exact commit selected for this run, and the same
       # value goes to the accuracy calls below, so the checkout and the wheel
@@ -463,6 +466,15 @@ jobs:
           path: ${{ steps.workspace.outputs.trusted_rel }}
           persist-credentials: false
 
+      - name: Set the CI runtime image
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          CI_RUNTIME_IMAGE: download.t-head.cn/docker_test/vllm:v0.34.0-20261126-e48a294
+        run: |
+          printf 'PPU_CI_RUNTIME_IMAGE=%s\n' "$CI_RUNTIME_IMAGE" >> "$GITHUB_ENV"
+          printf 'PPU_CI_RUNTIME_IMAGE_V034=%s\n' "$CI_RUNTIME_IMAGE" >> "$GITHUB_ENV"
+
       - name: Resolve tag to immutable digest once
         id: resolve
         env:
@@ -564,12 +576,13 @@ jobs:
       - id: configured
         name: Check notification configuration
         env:
+          PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}
           PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
         run: |
           # Job-level if: uses case-insensitive GitHub Actions expressions.
           # Enforce exact-case repository and branch matching here so mixed-case
           # refs such as refs/heads/Main or refs/heads/Releases/candidate cannot send.
-          if [[ -n "$PPU_CI_NOTIFY_WEBHOOK_URL" ]]; then
+          if [[ -n "$PPU_CI_NOTIFY_TARGETS_JSON" || -n "$PPU_CI_NOTIFY_WEBHOOK_URL" ]]; then
             case "$GITHUB_REPOSITORY" in
               vllm-project/vllm-sail)
                 case "$GITHUB_REF" in
@@ -617,6 +630,7 @@ jobs:
           NOTIFY_RECIPE_RESULT: ${{ needs.recipe-model-sanity.result }}
           NOTIFY_LEGACY_MATRIX: ${{ needs.select.outputs.matrix }}
           NOTIFY_RECIPE_MATRIX: ${{ needs.select.outputs.recipe_matrix }}
+          PPU_CI_NOTIFY_TARGETS_JSON: ${{ secrets.PPU_CI_NOTIFY_TARGETS_JSON }}
           PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
           PPU_CI_NOTIFY_SIGNING_SECRET: ${{ secrets.PPU_CI_NOTIFY_SIGNING_SECRET }}
           PPU_CI_NOTIFY_ROSTER_JSON: ${{ secrets.PPU_CI_NOTIFY_ROSTER_JSON }}
